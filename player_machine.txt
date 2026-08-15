@@ -1,0 +1,283 @@
+# --- player state machine ($2965-$2C05) ------------------------------------
+def rd_cell_below():
+    """$2D88: the cell at the position + $10 (below)."""
+    return rd_cell((cur_hl() + 0x1000) & 0xFFFF)
+
+
+def rd_cell_above():
+    """$2D81: the cell at the position + $F0 (above)."""
+    return rd_cell((cur_hl() + 0xF000) & 0xFFFF)
+
+
+def state_set_facing(b):
+    """$2BFD: FFD5 = (FFD5 & 1) | b."""
+    wb(0xFFD5, (rb(0xFFD5) & 1) | b)
+
+
+def player_tick():
+    """$2965: the player action dispatch."""
+    mem[0xFFE3] = 0
+    joy = rb(0xFF8A)
+    if joy & 0x02:                        # B: jump left
+        return jump_try(0xF0, 2)
+    if joy & 0x01:                        # A: jump right
+        return jump_try(0x10, 3)
+    if joy & 0x40:                        # up: climb up
+        return climb_up_state()
+    if joy & 0x80:                        # down: climb down
+        return climb_down_state()
+    return state_recalc(rb(0xFFD5))
+
+
+def jump_try(off, c):
+    """$298F: the cell in the jump direction decides the action."""
+    hl = (cur_hl() + (off & 0xFF)) & 0xFFFF
+    cell = rd_cell(hl)
+    if cell == 0:
+        return jump_start(c)
+    if cell == 1:
+        return jump_bump(c)
+    if cell == 2 or cell == 6:
+        return push_block(c)
+    if cell == 3:
+        return ladder_grab(c)
+    if cell == 4:
+        return step_up(c)
+    return state_recalc(c)
+
+
+def jump_start(c):
+    """$29B2: begin a jump. The state = facing|$0E (or facing)."""
+    if state_cell() == 1:
+        c = (c & 1) | 0x0E
+    set_state(c)
+    mem[0xC100 + cur_off()] |= 0x10
+    return c
+
+
+def jump_bump(c):
+    """$2B20: bump into a wall (state $12/$0A)."""
+    b = 0x0A
+    if state_cell() == 1:
+        b = 0x12
+    c = (c & 1) | b
+    set_state(c)
+    return c
+
+
+def step_up(c):
+    """$29C6: step up onto a platform (states $1A/$2A)."""
+    if state_cell() == 1:
+        c = (c & 1) | 0x2A
+    else:
+        c = (c & 1) | 0x1A
+    hl = cur_hl()
+    set_state(c)
+    mem[0xC100 + cur_off()] |= 0x10
+    mem[0xFFE4] = hl & 0xFF
+    mem[0xFFE5] = hl >> 8
+    mem[0xFFE3] = (c & 1) | 0x80
+    slot = find_slot()
+    if slot is not None:
+        mem[slot] = 4
+        mem[slot + 1] = 0
+        mem[slot + 2] = ((c & 1) ^ 1) | 0x0C
+        mem[slot + 3] = hl & 0xFF
+        mem[slot + 4] = hl >> 8
+    slot = find_slot()
+    if slot is not None:
+        mem[slot] = 4
+        mem[slot + 1] = 0
+        mem[slot + 2] = (c & 1) | 0x0C
+        mem[slot + 3] = hl & 0xFF
+        mem[slot + 4] = hl >> 8
+    return c
+
+
+def ladder_grab(c):
+    """$2A3D: grab a ladder (states $1C/$1E)."""
+    if state_cell() == 1:
+        c = (c & 1) | 0x1E
+    else:
+        c = (c & 1) | 0x1C
+    mem[0xFFD5] = c
+    if rd_cell(cur_hl()) != 0:
+        return state_recalc(c)
+    mem[0xC100 + cur_off()] = 3
+    return c
+
+
+def push_block(c):
+    """$2AA1: push a block (states $20/$28)."""
+    hl = cur_hl()
+    cell = rd_cell(hl)
+    mem[0xFF9D] = cell | 0x20
+    wr_cell(hl, 0)
+    if state_cell() == 1:
+        c = (c & 1) | 0x28
+    c |= 0x20
+    set_state(c)
+    mem[0xC100 + cur_off()] |= 0x10
+    # wait for the push animation (FFE1)
+    while rb(0xFFE1) == 0:
+        yield_frame()
+    hl = cur_hl()
+    wb(0xFFD8, hl & 0xFF)
+    wb(0xFFD7, hl >> 8)
+    slot = find_slot()
+    if slot is not None:
+        mem[slot] = mem[0xFF9D] & 0x0F
+        mem[slot + 1] = 0
+        mem[slot + 2] = (rb(0xFFD5) & 1) | 0x04
+        mem[slot + 3] = hl & 0xFF
+        mem[slot + 4] = hl >> 8
+        mem[slot + 0x18] = 0
+        mem[slot + 0x19] = hl & 0xFF
+        mem[slot + 0x1A] = 0
+    entity_spawn(7, (rb(0xFFD5) & 1) | 0x0E)
+    return c
+
+
+def state_recalc(c):
+    """$2B82: idle state selection from the current/above cells."""
+    st = state_cell()
+    if st == 1:
+        c = (c & 1) | 0x10
+    else:
+        above = rd_cell_above() & 7
+        if above == 3:
+            c = (c & 1) | 0x20
+        else:
+            c = c & 1
+    mem[0xFFD5] = c
+    return c
+
+
+def climb_down_state():
+    """$2B32: climb down (states $06/$16)."""
+    if rb(0xFFD7) == 0x10:
+        return state_recalc(rb(0xFFD5))
+    above = rd_cell_above()
+    if above >= 2:
+        return state_recalc(rb(0xFFD5))
+    b = 0x06
+    if above != 1:
+        b = 0x16
+    if state_cell() != 1:
+        return state_recalc(rb(0xFFD5))
+    return climb_apply(b)
+
+
+def climb_up_state():
+    """$2B4D: climb up (states $08/$18)."""
+    if state_cell() == 1:
+        b = 0x08
+        if rd_cell_below() >= 2:
+            return state_recalc(rb(0xFFD5))
+    else:
+        b = 0x18
+        if rd_cell_below() != 1:
+            return state_recalc(rb(0xFFD5))
+    return climb_apply(b)
+
+
+def climb_apply(b):
+    """$2B66: the state set + the cell move for a climb."""
+    c = rb(0xFFD5)
+    wb(0xFFD5, (c & 1) | b)
+    entity_spawn(7, (c & 1) | b)
+    a = mem[0xC100 + cur_off()]
+    mem[0xC100 + cur_off()] = a & 7
+    above_off = cell_off((cur_hl() + (0xF000 if b in (0x08, 0x18) else 0x1000)) & 0xFFFF)
+    mem[0xC100 + above_off] |= 0x10
+    return (c & 1) | b
+
+
+# --- walk-down ($2948/$2BA8) ------------------------------------------------
+def walk_start():
+    """$2948: start a descent when the cell below is empty and we stand free."""
+    if rd_cell_below() != 0:
+        return False
+    if state_cell() != 0:
+        return False
+    mem[0xC100 + cur_off()] = 0
+    state_set_facing(4)
+    walk_down()
+    mem[0xC100 + cur_off()] |= 0x10
+    return True
+
+
+def walk_down():
+    """$2BA8: the descent (row += 2 per frame until aligned + grounded)."""
+    entity_spawn(7, (rb(0xFFD5) & 1) | 4)
+    while True:
+        yield_frame()
+        joy = rb(0xFF8A)
+        if joy & 0x20:                       # left held: face left
+            wb(0xFFD5, rb(0xFFD5) & 0xFE)
+        elif joy & 0x10:                     # right held: face right
+            wb(0xFFD5, rb(0xFFD5) | 1)
+        add_pos(0x0200)
+        if rb(0xFFD7) & 0x0F != 0:
+            continue
+        if rd_cell_below() == 0:
+            continue
+        break
+    wb(0xFFFD, 1)                            # SFX
+    state_set_facing(0x14)
+    while rb(0xFFE1) == 0:
+        yield_frame()
+    state_set_facing(0x00)
+    return
+
+
+# --- TaskGame main loop ($28D8) --------------------------------------------
+def task_game_loop():
+    """$28D8: the TaskGame main loop."""
+    while True:
+        walk_start()
+        gravity()
+        wait_while_busy()
+        wb(0xFFB7, 0)
+        wb(0xFFB8, 0)
+        mem[0xC7F7] = 0
+        wait_while_busy()
+        st = rb(0xFFD5) & 0x0E
+        if st != 0 and rb(0xFFE1) != 0:
+            c = rb(0xFFD5)
+            if st == 6:
+                de = 0xF000
+            elif st == 8:
+                de = 0x1000
+            elif c & 1:
+                de = 0x10
+            else:
+                de = 0xFFF0
+            add_pos(de)
+            state_recalc(c)
+            walk_start()
+            gravity()
+        if rb(0xFFA1) != 0:
+            wait_while_busy()
+        player_tick()
+        # DA5D cell maintenance ($376F)
+        a = rb(0xDA5D)
+        if a & 0x1E == 0:
+            hl = (rb(0xDA5F) << 8) | rb(0xDA60)
+            b = 0
+            cell = rd_cell((hl + 0x1000) & 0xFFFF)
+            if cell == 3:
+                b = 0x20
+            wb(0xDA5D, (a & 1) | b)
+        yield_frame()
+
+
+def wait_while_busy():
+    """$293A: wait while FFA1, running gravity."""
+    while True:
+        yield_frame()
+        if rb(0xFFA1) == 0:
+            return
+        gravity()
+
+

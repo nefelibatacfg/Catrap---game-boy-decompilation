@@ -1,0 +1,261 @@
+# --- TaskInput ($325B-$34C1): the entity/enemy AI --------------------------
+def set_bc_flag():
+    wb(0xFFBC, 1)
+
+
+def wait_idle():
+    """$36DF: wait while FFA1 (runs the frame-wait with animation)."""
+    while rb(0xFFA1) != 0:
+        frame_wait_anim()
+
+
+def frame_wait_anim():
+    """$36FF: one frame of the anim wait (the object update + yield)."""
+    yield_frame()
+    a = rb(0xFFBB)
+    if a == 1:
+        pass
+    if rb(0xDA5B) != 0xFF:
+        pass
+    return
+
+
+def wait_frames_b(b):
+    """$36E8: wait b frames."""
+    for _ in range(b):
+        yield_frame()
+        frame_wait_anim()
+
+
+def task_input():
+    """$325B: the entity task. Runs while the button is held."""
+    set_bc_flag()
+    frame_wait_anim()
+    while True:
+        yield_frame()
+        if rb(0xFFBB) == 1:
+            # action phase: process the player/entity at the index
+            idx = (rb(0xFFB8) & 3) << 8 | rb(0xFFB7)
+            if idx == 0:
+                return task_input_end()
+            e = 0xC7F7 + (idx - 1) * 3
+            t = mem[e]
+            if t == 0:
+                return task_input_end()
+            if t == 7 or t == 0x13:
+                entity_player_tick()
+            if rb(0xFF8A) != 0:
+                continue
+            return task_input_end()
+        else:
+            entity_dispatch_scan()
+            if rb(0xFF8A) & 1:
+                continue
+            return task_input_end()
+
+
+def task_input_end():
+    if rb(0xFFBC) != 0:
+        return task_input_end()
+    wb(0xFFBB, 0)
+    # task 1 state = 1; exit with 0
+    return 'exit'
+
+
+def entity_dispatch_scan():
+    """$32B2: scan the entity table; process enemies (7) and blocks (2/3/6)."""
+    wb(0xFFBC, 0)
+    e = entity_de()
+    t = mem[e]
+    if t == 0:
+        return
+    entity_next()
+    wb(0xFFB4, t)
+    if t & 0x0F == 7:
+        enemy_tick()
+    elif t & 0x0F in (2, 3, 6):
+        block_tick()
+    return
+
+
+def enemy_tick():
+    """$32DE/$34E6: the enemy state dispatch."""
+    wait_idle()
+    st = mem[entity_de() + 1]
+    if st == 0xFF:
+        enemy_respawn()
+        return
+    if st == 0x40:
+        enemy_kill()
+        return
+    c = st
+    if c & 0xFE == 0x1A or c & 0xFE == 0x2A or c == 0x28:
+        enemy_walk(c)
+        return
+    if c & 0x0E == 0x02 or c & 0x0E == 0x0A or c & 0x0E == 0x0E:
+        enemy_move_h(c)
+        return
+    if c & 0x0E == 0x04:
+        enemy_climb(c)
+        return
+    if c & 0x0E == 0x06:
+        enemy_move_d(c)
+        return
+    if c & 0x0E == 0x08:
+        enemy_move_u(c)
+        return
+    return
+
+
+def enemy_respawn():
+    """$3652: the enemy died -> the player respawn helper."""
+    set_bc_flag()
+    # player respawn at the spawn point ($099C)
+    wb(0xFFD7, rb(0xFFC2))
+    wb(0xFFD8, rb(0xFFC1))
+    wb(0xFFBD, 0)
+    wb(0xFFBE, 0)
+    wb(0xFFBC, 0)
+    return
+
+
+def enemy_kill():
+    """$365A: the enemy killed the player."""
+    a = mem[entity_de() + 2] & 0xF0
+    wb(0xDA79, a)
+    wb(0xDA5D, (rb(0xDA5D) & 1) | 4)
+    # death anim
+    frame_wait_anim()
+    wb(0xFFBC, 0)
+    return
+
+
+def enemy_move_h(c):
+    """$354F: the horizontal move (de = $FFF0/$10 by bit 5)."""
+    de = 0xFFF0
+    if c & 0x20:
+        de = 0x10
+    return enemy_apply_move(c, de)
+
+
+def enemy_move_u(c):
+    """$3560: the up move (de = $F000)."""
+    return enemy_apply_move(c, 0xF000)
+
+
+def enemy_move_d(c):
+    """$355B: the down move (de = $1000)."""
+    return enemy_apply_move(c, 0x1000)
+
+
+def enemy_apply_move(c, de):
+    """$3565: move the enemy; the FFD7/FFD8 becomes the enemy position."""
+    e = cur_off()
+    mem[0xC100 + e] &= 7
+    add_pos(de)
+    mem[0xC100 + cur_off()] |= 0x10
+    wb(0xFFB5, rb(0xFFD7))
+    wb(0xFFB6, rb(0xFFD8))
+    wb(0xFFD5, c)
+    move_done()
+    return
+
+
+def enemy_walk(c):
+    """$3528: the enemy hops toward the player."""
+    wb(0xFFBC, 1)
+    wb(0xFFD5, c & 1)
+    jump_cloud()
+    wait_frames_b(10)
+    c ^= 1
+    jump_cloud()
+    wait_frames_b(12)
+    e = cur_off()
+    mem[0xC100 + e] = 4
+    enemy_move_h(c)
+    return
+
+
+def jump_cloud():
+    """$3732: spawn the hop dust object."""
+    slot = find_slot()
+    if slot is not None:
+        mem[slot] = 4
+        mem[slot + 1] = 0
+        mem[slot + 2] = (rb(0xFFD5) & 1) | 0x0E
+        mem[slot + 3] = rb(0xFFD7)
+        mem[slot + 4] = rb(0xFFD8)
+    return
+
+
+def enemy_climb(c):
+    """$3582: the enemy climbs."""
+    set_bc_flag()
+    e = cur_off()
+    mem[0xC100 + e] &= 7
+    wb(0xFFD5, c)
+    row = mem[entity_de() + 2] & 0xF0
+    while rb(0xFFD7) != row:
+        yield_frame()
+        frame_wait_anim()
+        add_pos(0xFF00)
+    e = cur_off()
+    mem[0xC100 + e] |= 0x10
+    wb(0xFFBC, 0)
+    return
+
+
+def move_done():
+    """$3673: the move completion: redraw, wait E1, state recalc."""
+    set_bc_flag()
+    while rb(0xFFE1) == 0:
+        yield_frame()
+        frame_wait_anim()
+    state_recalc(rb(0xFFD5))
+    e = cur_off()
+    if mem[0xC100 + e] & 7 == 1:
+        mem[0xC100 + e] |= 0x10
+    wb(0xFFBC, 0)
+    return
+
+
+def block_tick():
+    """$339C/$35AF: the block processing."""
+    set_bc_flag()
+    e = entity_de()
+    cell = mem[e + 1]
+    # clear the player bit at the block cell
+    mem[0xC100 + cell] &= 0x10
+    # redraw + find a slot
+    slot = find_slot()
+    t = rb(0xFFB4)
+    if slot is not None:
+        mem[slot] = t & 0x0F
+        mem[slot + 1] = 0
+        mem[slot + 3] = cell & 0xFF
+        mem[slot + 4] = cell >> 8
+    # the block state after the entity
+    st = mem[e + 1]
+    # the block is being pushed or settling
+    if slot is not None:
+        mem[slot + 2] = 6
+        mem[slot + 5] = 0
+        mem[slot + 0x19] = mem[e] & 0xF0
+    frame_wait_anim()
+    wb(0xFFBC, 0)
+    return
+
+
+# --- enemy/entity entry from the action phase ($34C1) ----------------------
+def entity_player_tick():
+    """$34C1: the action-phase processing (the player + the entities)."""
+    wb(0xFFBC, 0)
+    e = entity_de()
+    if mem[e] == 0:
+        return
+    wb(0xFFB4, mem[e])
+    if mem[e] & 0x0F == 7:
+        enemy_tick()
+    elif mem[e] & 0x0F in (2, 3, 6):
+        block_tick()
+    return
